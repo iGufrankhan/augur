@@ -1,3 +1,0 @@
-
-class LoginException(Exception):
-    pass

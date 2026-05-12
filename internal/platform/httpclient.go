@@ -1,0 +1,634 @@
+package platform
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"log/slog"
+	"math/rand/v2"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ErrNotModified is returned by GetConditional when the server returns 304.
+// Callers should use their cached copy of the data.
+var ErrNotModified = errors.New("not modified (304)")
+
+// ErrNotFound wraps 404 responses from the forge API. Callers that want to
+// treat a missing optional resource (e.g. /releases on a repo that never
+// cut a release) as non-fatal can check errors.Is(err, ErrNotFound).
+var ErrNotFound = errors.New("not found")
+
+// ErrForbidden wraps 403 responses that are NOT rate-limit exhaustions
+// (no Retry-After, non-zero X-RateLimit-Remaining). These usually mean the
+// token can't see a particular resource — private GitLab project, repo
+// with restricted visibility, endpoint requiring a scope the token lacks.
+// Callers can check errors.Is(err, ErrForbidden) to skip the endpoint
+// without failing the whole collection.
+var ErrForbidden = errors.New("forbidden")
+
+// ErrGone wraps 410 Gone responses and unfollowable 3xx redirects (the
+// Location header was missing or the redirect chain looped). Distinct from
+// ErrNotFound: 404 means "never existed or cannot see it", 410 means
+// "existed and was deliberately removed". Callers can check errors.Is(err,
+// ErrGone) to skip the resource without failing the whole collection.
+var ErrGone = errors.New("gone")
+
+// maxRedirectHops caps how many 301/302/307/308 follows a single Get call
+// will perform before giving up. GitHub's best-practices guide says to
+// always follow redirects; this cap protects against pathological chains
+// (loops, rename-of-rename-of-rename) that would otherwise burn minutes
+// per endpoint under the old "retry unexpected status" path.
+const maxRedirectHops = 5
+
+// AuthStyle controls how API tokens are sent in HTTP requests.
+// GitHub and GitLab use different authentication header formats.
+type AuthStyle int
+
+const (
+	// AuthGitHub sends "Authorization: token <key>" (GitHub PAT format).
+	AuthGitHub AuthStyle = iota
+	// AuthGitLab sends "PRIVATE-TOKEN: <key>" (GitLab PAT format).
+	AuthGitLab
+)
+
+// HTTPClient wraps http.Client with rate-limiting, key rotation, retries, and
+// pagination. Used by both GitHub and GitLab implementations.
+type HTTPClient struct {
+	inner     *http.Client
+	keys      *KeyPool
+	logger    *slog.Logger
+	baseURL   string // e.g. "https://api.github.com" or "https://gitlab.com/api/v4"
+	authStyle AuthStyle
+
+	// etagCache stores ETags from previous responses, keyed by URL path.
+	// When a cached ETag exists, Get sends If-None-Match, which saves API quota
+	// when the data hasn't changed (GitHub returns 304 without counting against
+	// the rate limit). The cache is bounded by typical usage patterns (one entry
+	// per unique endpoint path hit during a collection cycle).
+	etagMu    sync.RWMutex
+	etagCache map[string]string
+
+	// onPermanentRedirect is invoked whenever Get observes a 301 or 308
+	// response it's about to follow. The callback receives the from URL
+	// (the one Get was trying to reach) and the to URL (the Location
+	// header target, resolved to an absolute URL). Intended for the
+	// scheduler to detect repo renames and update repos.repo_git.
+	//
+	// Not invoked for 302/307 — those are temporary and must not mutate
+	// durable state. Guarded against nil at each call site.
+	redirectMu          sync.RWMutex
+	onPermanentRedirect func(from, to string)
+}
+
+// NewHTTPClient creates a platform-aware HTTP client with the given auth style.
+// AuthGitHub sends "Authorization: token <key>"; AuthGitLab sends "PRIVATE-TOKEN: <key>".
+// Uses a transport tuned for high-throughput API collection: keepalives enabled,
+// generous idle connection pool, and HTTP/2 support (Go's default).
+func NewHTTPClient(baseURL string, keys *KeyPool, logger *slog.Logger, authStyle AuthStyle) *HTTPClient {
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20, // GitHub/GitLab APIs are few hosts with many requests
+		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
+		// ResponseHeaderTimeout caps how long we wait for the server's
+		// response headers after sending the request. A stalled
+		// connection (firewall drop, server hang) would otherwise hold
+		// a worker slot for the full whole-request Timeout. 15s is well
+		// above GitHub's normal response-header latency (~200ms) but
+		// below the whole-request budget so stalls fail fast.
+		ResponseHeaderTimeout: 15 * time.Second,
+	}
+	return &HTTPClient{
+		inner: &http.Client{
+			// 60s whole-request timeout. Accommodates the ~1 MB responses
+			// GraphQL queries return for batches of 25 parents with full
+			// nested children, and leaves a 6× margin above observed p99
+			// GraphQL response times (~10s) for firewall-induced jitter.
+			// Previously 30s, which left only 3× margin.
+			Timeout:   60 * time.Second,
+			Transport: transport,
+			// Our Get loop owns redirect handling explicitly so the logic is
+			// in one place (hop cap, logging, Location-absent → ErrGone).
+			// ErrUseLastResponse tells Go to return the 3xx to us without
+			// attempting its own follow.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		keys:      keys,
+		logger:    logger,
+		baseURL:   strings.TrimSuffix(baseURL, "/"),
+		authStyle: authStyle,
+		etagCache: make(map[string]string),
+	}
+}
+
+// Keys returns the underlying key pool, allowing callers to get keys for
+// non-standard requests (e.g., GraphQL via POST).
+func (c *HTTPClient) Keys() *KeyPool {
+	return c.keys
+}
+
+// OnPermanentRedirect installs a callback that fires whenever Get observes
+// a 301 or 308 response it's about to follow. The callback receives the
+// from URL (the request that received the redirect) and the to URL
+// (resolved absolute target). Use case: the scheduler installs a hook per
+// job that updates repos.repo_git / repo_owner / repo_name when the
+// redirect is on the repo root, so the DB stays in sync with GitHub's
+// rename/transfer events.
+//
+// Only permanent redirects fire the hook. 302/307 are temporary — the
+// repo's canonical URL hasn't changed, so mutating the DB would be wrong.
+//
+// Passing a nil hook clears any previously-installed callback.
+// Safe to call at any time; internally synchronized.
+func (c *HTTPClient) OnPermanentRedirect(hook func(from, to string)) {
+	c.redirectMu.Lock()
+	c.onPermanentRedirect = hook
+	c.redirectMu.Unlock()
+}
+
+const maxRetries = 10
+
+// Get performs a single authenticated GET request with retries and rate-limit handling.
+func (c *HTTPClient) Get(ctx context.Context, path string) (*http.Response, error) {
+	url := c.baseURL + path
+	// Redirect hops consumed by this call. Counted separately from retry
+	// attempts so a rename-then-rate-limited chain doesn't prematurely
+	// exhaust the retry budget, and a loop doesn't run forever.
+	redirectHops := 0
+
+	for attempt := range maxRetries {
+		key, err := c.keys.GetKey(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting API key: %w", err)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		// Set platform-appropriate auth header.
+		// GitHub: "Authorization: token <key>" (PATs and old OAuth tokens).
+		// GitLab: "PRIVATE-TOKEN: <key>" (Personal Access Tokens).
+		switch c.authStyle {
+		case AuthGitLab:
+			req.Header.Set("PRIVATE-TOKEN", key.Token)
+		default: // AuthGitHub
+			req.Header.Set("Authorization", "token "+key.Token)
+		}
+		req.Header.Set("Accept", "application/json")
+
+		// Conditional request: send If-None-Match when we have a cached ETag.
+		// GitHub does not count 304 responses against the rate limit.
+		c.etagMu.RLock()
+		if etag, ok := c.etagCache[path]; ok {
+			req.Header.Set("If-None-Match", etag)
+		}
+		c.etagMu.RUnlock()
+
+		resp, err := c.inner.Do(req)
+		if err != nil {
+			c.logger.Warn("HTTP request failed, retrying",
+				"url", url, "attempt", attempt+1, "error", err)
+			// Context-aware sleep: a cancelled job wakes immediately
+			// instead of sitting here for 20+s across the retry chain.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt+1) * 2 * time.Second):
+			}
+			continue
+		}
+
+		c.keys.UpdateFromResponse(key, resp)
+
+		// Log rate limit state on every response so operators can monitor usage.
+		if remaining := resp.Header.Get("X-RateLimit-Remaining"); remaining != "" {
+			resource := resp.Header.Get("X-RateLimit-Resource")
+			if resource == "" {
+				resource = "core"
+			}
+			limit := resp.Header.Get("X-RateLimit-Limit")
+			reset := resp.Header.Get("X-RateLimit-Reset")
+			c.logger.Debug("rate limit status",
+				"resource", resource, "remaining", remaining,
+				"limit", limit, "reset", reset)
+		}
+
+		// Cache ETag from successful responses for future conditional requests.
+		if etag := resp.Header.Get("ETag"); etag != "" && resp.StatusCode == http.StatusOK {
+			c.etagMu.Lock()
+			c.etagCache[path] = etag
+			c.etagMu.Unlock()
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusOK:
+			return resp, nil
+		case resp.StatusCode == http.StatusNotModified:
+			// 304: data hasn't changed since our last request.
+			// This does NOT count against GitHub's rate limit.
+			resp.Body.Close()
+			return nil, ErrNotModified
+		case resp.StatusCode == http.StatusNotFound:
+			resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, url)
+		case resp.StatusCode == http.StatusGone:
+			// 410 — the resource existed but was deliberately removed (e.g.,
+			// a deleted GitHub issue). Never retryable; distinct from 404 so
+			// callers can tell "never existed / can't see it" apart from
+			// "existed and was deleted". isOptionalEndpointSkip treats
+			// ErrGone like ErrNotFound so the containing job continues.
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			c.logger.Warn("resource is gone (410)",
+				"url", url, "body_snippet", truncateBody(string(body), 200))
+			return nil, fmt.Errorf("%w: %s", ErrGone, url)
+		case resp.StatusCode == http.StatusMovedPermanently ||
+			resp.StatusCode == http.StatusFound ||
+			resp.StatusCode == http.StatusTemporaryRedirect ||
+			resp.StatusCode == http.StatusPermanentRedirect:
+			// 301/302/307/308 — follow the Location header. GitHub uses 301
+			// for permanent repo rename/transfer (the prelim phase updates
+			// repo_git separately via resolveRedirects); 302/307 for
+			// temporary redirects; 308 is the strict permanent variant. In
+			// all cases the contract is: re-issue the request against the
+			// URL in the Location header.
+			location := resp.Header.Get("Location")
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if location == "" {
+				// GitHub returns 3xx with no Location when it cannot determine
+				// the target (observed for individual issues that were moved
+				// during a rename where the issue numbering doesn't line up).
+				// The body often contains {"message":"Moved Permanently","url":""}.
+				// Nothing useful to retry — surface as ErrGone so callers skip.
+				c.logger.Warn("redirect with empty Location header — treating as gone",
+					"url", url, "status", resp.StatusCode,
+					"body_snippet", truncateBody(string(body), 200))
+				return nil, fmt.Errorf("%w: %s (redirect with empty Location)", ErrGone, url)
+			}
+			if redirectHops >= maxRedirectHops {
+				c.logger.Warn("redirect hop cap exceeded — treating as gone",
+					"url", url, "status", resp.StatusCode,
+					"location", location, "hops", redirectHops)
+				return nil, fmt.Errorf("%w: %s (redirect loop or chain longer than %d)",
+					ErrGone, url, maxRedirectHops)
+			}
+			redirectHops++
+			// Resolve relative Location (most GitHub Location headers are
+			// absolute, but RFC 7231 permits relative).
+			newURL := location
+			if !strings.HasPrefix(newURL, "http://") && !strings.HasPrefix(newURL, "https://") {
+				newURL = c.baseURL + location
+			}
+			c.logger.Info("following redirect",
+				"from", url, "to", newURL,
+				"status", resp.StatusCode, "hop", redirectHops)
+
+			// Notify the permanent-redirect hook on 301/308 only. 302/307
+			// are temporary and must not mutate durable state.
+			if resp.StatusCode == http.StatusMovedPermanently ||
+				resp.StatusCode == http.StatusPermanentRedirect {
+				c.redirectMu.RLock()
+				hook := c.onPermanentRedirect
+				c.redirectMu.RUnlock()
+				if hook != nil {
+					hook(url, newURL)
+				}
+			}
+
+			url = newURL
+			// Do not count this iteration against the retry budget — a
+			// redirect is not a retry. Decrement attempt so the outer
+			// `for attempt := range maxRetries` loop gives us a fresh slot.
+			// (range-int loops don't let us modify the iterator; instead we
+			// just `continue` and accept at most maxRetries hops total,
+			// which is fine because maxRedirectHops=5 < maxRetries=10.)
+			continue
+		case resp.StatusCode == http.StatusUnauthorized:
+			// 401 = bad credentials. Permanently invalidate this key.
+			resp.Body.Close()
+			c.keys.InvalidateKey(key)
+			continue
+		case resp.StatusCode == http.StatusBadRequest:
+			// 400 = malformed request. GitHub returns HTML "Whoa there!" for
+			// invalid queries (e.g., bad search syntax). Not retryable.
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			c.logger.Warn("bad request (not retrying)",
+				"url", url, "status", 400, "body_snippet", truncateBody(string(body), 200))
+			return nil, fmt.Errorf("bad request: %s", url)
+		case resp.StatusCode == http.StatusUnprocessableEntity:
+			// 422 = validation failed. Also not retryable.
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			c.logger.Warn("unprocessable entity (not retrying)",
+				"url", url, "status", 422, "body_snippet", truncateBody(string(body), 200))
+			return nil, fmt.Errorf("unprocessable entity: %s", url)
+		case resp.StatusCode == http.StatusForbidden:
+			// 403 can mean rate limit, secondary rate limit, or resource not
+			// accessible. Header signals are authoritative — they carry the
+			// reset timing that retry-after plumbing relies on, so they are
+			// always consulted first. Body inspection is the fallback net
+			// for cases where a proxy strips the headers, GitHub's response
+			// shape changes, or an unauthenticated request leaks through
+			// (the "for <IP>" body shape).
+			if resp.Header.Get("Retry-After") != "" {
+				resp.Body.Close()
+				wait := parseRetryAfter(resp)
+				c.logger.Info("secondary rate limit", "url", url, "wait", wait)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(wait):
+				}
+				continue
+			}
+			if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+				resp.Body.Close()
+				resource := resp.Header.Get("X-RateLimit-Resource")
+				if resource == "" {
+					resource = "core"
+				}
+				resetStr := resp.Header.Get("X-RateLimit-Reset")
+				c.logger.Info("rate limit exhausted",
+					"url", url, "resource", resource, "reset", resetStr)
+				continue
+			}
+			// Headers said nothing definitive. Read the body and check whether
+			// the message text reveals a rate limit anyway.
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if isAnonymousRateLimitBody(body) {
+				// Unauthenticated request reached us. Every code path that
+				// builds an HTTPClient call goes through GetKey() — getting
+				// this body shape means a key was unset, the wrong client
+				// was used, or a proxy stripped the Authorization header.
+				// Log at ERROR so on-call sees the regression, then back off
+				// like a regular rate limit so we don't hot-loop on the bug.
+				c.logger.Error("403 with unauthenticated rate-limit body — possible key-leak or unauthenticated request bug",
+					"url", url,
+					"body_snippet", truncateBody(string(body), 240))
+				wait := jitteredBackoff(attempt)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(wait):
+				}
+				continue
+			}
+			if isRateLimitBody(body) {
+				c.logger.Warn("403 with rate-limit body but no rate-limit headers — treating as throttled",
+					"url", url,
+					"body_snippet", truncateBody(string(body), 240))
+				wait := jitteredBackoff(attempt)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(wait):
+				}
+				continue
+			}
+			// 403 for other reasons (private repo, no permission) — not a key problem.
+			return nil, fmt.Errorf("%w: %s (not a rate limit — may be a private repo or insufficient scope)", ErrForbidden, url)
+		case resp.StatusCode == http.StatusTooManyRequests:
+			resp.Body.Close()
+			wait := parseRetryAfter(resp)
+			c.logger.Info("rate limited", "url", url, "wait", wait)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		case resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusGatewayTimeout:
+			// 502/503/504 — server/gateway error. These are transient.
+			resp.Body.Close()
+			backoff := time.Duration(1<<min(attempt, 6)) * time.Second // 1s, 2s, 4s, 8s, 16s, 32s, 64s
+			jitter := time.Duration(rand.IntN(int(backoff/2) + 1))
+			wait := backoff + jitter
+			c.logger.Warn("server error, retrying with backoff",
+				"url", url, "status", resp.StatusCode, "wait", wait, "attempt", attempt+1)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		default:
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			c.logger.Warn("unexpected status",
+				"url", url, "status", resp.StatusCode, "body_snippet", truncateBody(string(body), 200), "attempt", attempt+1)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt+1) * 2 * time.Second):
+			}
+			continue
+		}
+	}
+
+	return nil, fmt.Errorf("exhausted %d retries for %s", maxRetries, url)
+}
+
+// GetJSON performs a GET and decodes the response JSON into dest.
+func (c *HTTPClient) GetJSON(ctx context.Context, path string, dest any) error {
+	resp, err := c.Get(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return json.NewDecoder(resp.Body).Decode(dest)
+}
+
+// nextPageFunc determines the next page path from an HTTP response.
+// Returns "" when there are no more pages.
+type nextPageFunc func(resp *http.Response, basePath string) string
+
+// nextPageGitHub extracts the next page URL from GitHub's Link header.
+func nextPageGitHub(resp *http.Response, _ string) string {
+	return extractNextLink(resp)
+}
+
+// nextPageGitLab checks X-Next-Page first, then falls back to Link header.
+func nextPageGitLab(resp *http.Response, basePath string) string {
+	if nextPage := resp.Header.Get("X-Next-Page"); nextPage != "" {
+		pageNum, err := strconv.Atoi(nextPage)
+		if err != nil || pageNum == 0 {
+			return ""
+		}
+		p := setQueryParam(basePath, "page", nextPage)
+		if !strings.Contains(p, "per_page=") {
+			p += "&per_page=100"
+		}
+		return p
+	}
+	return extractNextLink(resp)
+}
+
+// paginate is the shared pagination engine used by both PaginateGitHub and
+// PaginateGitLab. The only behavioral difference is how the next page is
+// determined, which is injected via the nextPage function.
+func paginate[T any](ctx context.Context, c *HTTPClient, path string, nextPage nextPageFunc) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		currentPath := ensurePerPage(path)
+		basePath := currentPath
+
+		for currentPath != "" {
+			resp, err := c.Get(ctx, currentPath)
+			if err != nil {
+				// 304 Not Modified means the data hasn't changed since our last
+				// request (ETag match). This is not an error — just means zero new items.
+				if errors.Is(err, ErrNotModified) {
+					return // no new data, stop pagination
+				}
+				var zero T
+				yield(zero, err)
+				return
+			}
+
+			var page []T
+			if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+				resp.Body.Close()
+				var zero T
+				yield(zero, fmt.Errorf("decoding page: %w", err))
+				return
+			}
+			resp.Body.Close()
+
+			for _, item := range page {
+				if !yield(item, nil) {
+					return
+				}
+			}
+
+			currentPath = nextPage(resp, basePath)
+		}
+	}
+}
+
+// ensurePerPage adds per_page=100 if not already present.
+func ensurePerPage(path string) string {
+	if strings.Contains(path, "per_page=") {
+		return path
+	}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + "per_page=100"
+}
+
+// PaginateGitHub yields items from a paginated GitHub API endpoint.
+// GitHub uses Link headers for pagination.
+func PaginateGitHub[T any](ctx context.Context, c *HTTPClient, path string) iter.Seq2[T, error] {
+	return paginate[T](ctx, c, path, nextPageGitHub)
+}
+
+// PaginateGitLab yields items from a paginated GitLab API endpoint.
+// GitLab uses X-Next-Page or Link headers.
+func PaginateGitLab[T any](ctx context.Context, c *HTTPClient, path string) iter.Seq2[T, error] {
+	return paginate[T](ctx, c, path, nextPageGitLab)
+}
+
+// linkNextRE matches the "next" relation in a Link header.
+var linkNextRE = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+
+// extractNextLink parses the Link header for the "next" page URL.
+// Returns the path portion only (strips the host to keep requests going through our client).
+func extractNextLink(resp *http.Response) string {
+	link := resp.Header.Get("Link")
+	if link == "" {
+		return ""
+	}
+	matches := linkNextRE.FindStringSubmatch(link)
+	if len(matches) < 2 {
+		return ""
+	}
+	nextURL := matches[1]
+	// Extract just the path+query from the full URL.
+	if u, err := http.NewRequest("GET", nextURL, nil); err == nil {
+		return u.URL.RequestURI()
+	}
+	return nextURL
+}
+
+func setQueryParam(path, key, value string) string {
+	base := path
+	query := ""
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		base = path[:idx]
+		query = path[idx+1:]
+	}
+
+	// Remove existing key= param.
+	parts := strings.Split(query, "&")
+	var filtered []string
+	for _, p := range parts {
+		if p != "" && !strings.HasPrefix(p, key+"=") {
+			filtered = append(filtered, p)
+		}
+	}
+	filtered = append(filtered, key+"="+value)
+	return base + "?" + strings.Join(filtered, "&")
+}
+
+// jitteredBackoff returns a capped exponential backoff with random jitter,
+// used by 403-with-rate-limit-body fallback paths that lack an authoritative
+// Retry-After or X-RateLimit-Reset to honor. Caps at 64s + jitter so a
+// pathological loop on a permanent 403 doesn't burn a worker for hours.
+func jitteredBackoff(attempt int) time.Duration {
+	base := time.Duration(1<<min(attempt, 6)) * time.Second // 1s..64s
+	jitter := time.Duration(rand.IntN(int(base/2) + 1))
+	return base + jitter
+}
+
+// truncateBody returns the first n bytes of a response body for logging,
+// stripping HTML tags and collapsing whitespace for readability.
+func truncateBody(body string, n int) string {
+	// Strip HTML tags for cleaner log output.
+	var clean strings.Builder
+	inTag := false
+	for _, r := range body {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag && r != '\r':
+			if r == '\n' || r == '\t' {
+				r = ' '
+			}
+			clean.WriteRune(r)
+		}
+	}
+	s := strings.Join(strings.Fields(clean.String()), " ")
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
+}
+
+func parseRetryAfter(resp *http.Response) time.Duration {
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return 60 * time.Second
+	}
+	if secs, err := strconv.Atoi(ra); err == nil {
+		return time.Duration(secs) * time.Second
+	}
+	return 60 * time.Second
+}

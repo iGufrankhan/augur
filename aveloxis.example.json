@@ -1,0 +1,46 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "user": "augur",
+    "password": "",
+    "dbname": "augur",
+    "sslmode": "prefer"
+  },
+  "github": {
+    "api_keys": [],
+    "base_url": "https://api.github.com"
+  },
+  "gitlab": {
+    "api_keys": [],
+    "base_url": "https://gitlab.com/api/v4",
+    "gitlab_hosts": []
+  },
+  "collection": {
+    "batch_size": 1000,
+    "days_until_recollect": 1,
+    "workers": 12,
+    "repo_clone_dir": "~/aveloxis-repos/",
+    "force_full": false,
+    "matview_rebuild_day": "friday",
+    "matview_rebuild_on_startup": false,
+    "_refactor_modes_note": "Values 'rest' and 'graphql' select between the legacy REST and new GraphQL code paths added by the v0.18 series. Default 'rest' until v0.19.0 flips defaults. The comments mode key will land as phase 4 ships — see CLAUDE.md 'REST → GraphQL Refactor' section.",
+    "pr_child_mode": "rest",
+    "listing_mode": "rest",
+    "_threading_note": "threading_mode='sharded' fans PR batch fetching out across additional goroutines when enumerated PR count exceeds shard_size. Only takes effect when pr_child_mode='graphql' (the REST path is sequential per-PR and can't benefit). shard_size default 3000 matches the '1 extra worker per 3,000 items' rule.",
+    "threading_mode": "single",
+    "shard_size": 3000
+  },
+  "web": {
+    "addr": ":8082",
+    "base_url": "http://localhost:8082",
+    "session_secret": "change-me-to-a-random-string",
+    "dev_mode": false,
+    "github_client_id": "your-github-oauth-app-client-id",
+    "github_client_secret": "your-github-oauth-app-client-secret",
+    "gitlab_client_id": "your-gitlab-oauth-app-client-id",
+    "gitlab_client_secret": "your-gitlab-oauth-app-client-secret",
+    "gitlab_base_url": "https://gitlab.com"
+  },
+  "log_level": "info"
+}

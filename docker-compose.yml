@@ -1,125 +1,96 @@
-#SPDX-License-Identifier: MIT
+# Aveloxis full-stack deployment with Docker Compose.
+#
+# Starts 4 services:
+#   - postgres: PostgreSQL database with persistent volume
+#   - serve:    Collection scheduler + monitoring dashboard (:5555)
+#   - web:      Web GUI with OAuth, visualizations (:8082) (to avoid conflict with 8Knot on 8080)
+#   - api:      REST API for charts and stats (:8383)
+#
+# Usage:
+#   docker compose up -d          # Start all services
+#   docker compose logs -f serve  # Follow scheduler logs
+#   docker compose down           # Stop all services (data preserved)
+#   docker compose down -v        # Stop AND delete database volume (destructive!)
+#
+# The PostgreSQL data is stored in a named Docker volume (aveloxis-pgdata)
+# that persists across container rebuilds. Only `docker compose down -v`
+# destroys it.
+
 services:
-  augur-db:
-    build:
-      context: .
-      dockerfile: ./docker/database/Dockerfile
-    restart: unless-stopped
+  postgres:
+    image: postgres:16-alpine
     environment:
-      - "POSTGRES_DB=augur"
-      - "POSTGRES_USER=${AUGUR_DB_USER:-augur}"
-      - "POSTGRES_PASSWORD=${AUGUR_DB_PASSWORD:-augur}"
-      - "PGDATA=/var/lib/postgresql/data/pgdata"
-    ports:
-      - "${AUGUR_DB_PORT:-5432}:5432"
+      POSTGRES_DB: aveloxis
+      POSTGRES_USER: aveloxis
+      POSTGRES_PASSWORD: ${AVELOXIS_DB_PASSWORD:-aveloxis}
     volumes:
-      - augurpostgres:/var/lib/postgresql/data
-    networks:
-      - augur
-
-  redis:
-    image: "redis:alpine"
-    networks:
-      - augur
-
-  augur-keyman:
-    image: augur-keyman
-    restart: unless-stopped
-    build:
-      context: .
-      dockerfile: ./docker/keyman/Dockerfile
-    environment:
-      - REDIS_CONN_STRING=redis://redis:6379
-    depends_on:
-      - redis
-    networks:
-      - augur
-    user: 3456:3456  # Run as an arbitrary non-root user
-
-  rabbitmq:
-    image: augur-rabbitmq
-    build:
-      context: .
-      dockerfile: ./docker/rabbitmq/Dockerfile
-      args:
-      - RABBIT_MQ_DEFAULT_USER=${AUGUR_RABBITMQ_USERNAME:-augur}
-      - RABBIT_MQ_DEFAULT_PASSWORD=${AUGUR_RABBITMQ_PASSWORD:-password123}
-      - RABBIT_MQ_DEFAULT_VHOST=${AUGUR_RABBITMQ_VHOST:-augur_vhost}
-    networks:
-      - augur
-
-  augur:
-    image: augur-new:latest
-    build:
-      context: .
-      dockerfile: ./docker/backend/${AUGUR_TARGET:-Dockerfile}
-    volumes:
-      - cache:/cache:rw
-      - config:/config:rw
-      - facade:/facade:rw
-      - logs:/logs:rw
-    restart: unless-stopped
+      - aveloxis-pgdata:/var/lib/postgresql/data
     ports:
-      - 5002:5000
-    #extra_hosts:
-    #  - "host.docker.internal:host-gateway" #Be able to ping services on the local machine
-    environment:
-      - "AUGUR_DB=postgresql+psycopg2://${AUGUR_DB_USER:-augur}:${AUGUR_DB_PASSWORD:-augur}@augur-db:5432/augur"
-      - "AUGUR_DB_SCHEMA_BUILD=1"
-      - AUGUR_FACADE_REPO_DIRECTORY=/facade
-      - "AUGUR_FLAGS=$AUGUR_FLAGS"
-      - "AUGUR_GITHUB_API_KEY=${AUGUR_GITHUB_API_KEY}"
-      - "AUGUR_GITLAB_API_KEY=${AUGUR_GITLAB_API_KEY}"
-      - "AUGUR_GITHUB_USERNAME=${AUGUR_GITHUB_USERNAME}"
-      - "AUGUR_GITLAB_USERNAME=${AUGUR_GITLAB_USERNAME}"
-      - REDIS_CONN_STRING=redis://redis:6379
-      - RABBITMQ_CONN_STRING=amqp://${AUGUR_RABBITMQ_USERNAME:-augur}:${AUGUR_RABBITMQ_PASSWORD:-password123}@rabbitmq:5672/${AUGUR_RABBITMQ_VHOST:-augur_vhost}
-      - CONFIG_LOCATION=/config/config.yml
-      - CONFIG_DATADIR=/config
-      - CACHE_DATADIR=/cache
-      - CACHE_LOCKDIR=/cache
-      - CELERYBEAT_SCHEDULE_DB=/tmp/celerybeat-schedule.db
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aveloxis -d aveloxis"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Run migrations once before starting other services.
+  # This container exits after migrations complete.
+  migrate:
+    image: ghcr.io/aveloxis/aveloxis:latest
+    build: .
+    command: ["migrate"]
+    volumes:
+      - ./aveloxis.docker.json:/app/aveloxis.json:ro
     depends_on:
-      - augur-db
-      - redis
-      - augur-keyman
-      - rabbitmq
-    networks:
-      - augur
-    user: 2345:2345  # Run as an arbitrary non-root user
-    post_start:
-      # Make sure the user has access to the volumes
-      - command: chmod 777 /facade /logs /config /cache
-        user: root
-  
-  # Flower is a UI that helps more easily monitor running tasks for celery workers.
-  # This wont show you every error from the entire augur system, but it should show most of them.
-  # uncomment the section below to use flower
-  #flower:
-  #  image: augur-new:latest
-  #  restart: unless-stopped
-  #  command:
-  #    [ "celery", "-A", "augur.tasks.init.celery_app.celery_app", "flower", "--max-tasks=1000000" ]
-  #  ports:
-  #    - 5555:5555
-  #  environment:
-  #    - "AUGUR_DB=postgresql+psycopg2://${AUGUR_DB_USER:-augur}:${AUGUR_DB_PASSWORD:-augur}@augur-db:5432/augur"
-  #    - REDIS_CONN_STRING=redis://redis:6379
-  #    - RABBITMQ_CONN_STRING=amqp://${AUGUR_RABBITMQ_USERNAME:-augur}:${AUGUR_RABBITMQ_PASSWORD:-password123}@rabbitmq:5672/${AUGUR_RABBITMQ_VHOST:-augur_vhost}
-  #  depends_on:
-  #    - augur
-  #    - augur-db
-  #    - redis
-  #    - rabbitmq
-  #  networks:
-  #    - augur
-  
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  serve:
+    image: ghcr.io/aveloxis/aveloxis:latest
+    build: .
+    command: ["serve", "--workers", "${AVELOXIS_WORKERS:-12}", "--monitor", ":5555"]
+    volumes:
+      - ./aveloxis.docker.json:/app/aveloxis.json:ro
+      - aveloxis-repos:/data
+    ports:
+      - "5555:5555"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    image: ghcr.io/aveloxis/aveloxis:latest
+    build: .
+    command: ["web"]
+    volumes:
+      - ./aveloxis.docker.json:/app/aveloxis.json:ro
+    ports:
+      - "8082:8082"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  api:
+    image: ghcr.io/aveloxis/aveloxis:latest
+    build: .
+    command: ["api", "--addr", ":8383"]
+    volumes:
+      - ./aveloxis.docker.json:/app/aveloxis.json:ro
+    ports:
+      - "8383:8383"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 volumes:
-  augurpostgres:
-  cache:
-  config:
-  facade:
-  logs:
+  # Persistent PostgreSQL data — survives container rebuilds.
+  # Only destroyed by `docker compose down -v`.
+  aveloxis-pgdata:
 
-networks:
-  augur:
+  # Persistent bare clone directory for facade/git analysis.
+  aveloxis-repos:
